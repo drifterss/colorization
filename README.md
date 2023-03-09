@@ -1,2 +1,2 @@
-# colorization_
+# colorization
 image colorization
