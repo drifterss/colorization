@@ -1,7 +1,31 @@
+import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as cp
 from collections import OrderedDict
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, inChannels, outChannels, convNum):
+        super(ConvBlock, self).__init__()
+        self.inConv = nn.Sequential(
+            nn.Conv2d(inChannels, outChannels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(outChannels),
+            nn.ReLU()
+        )
+        layers = []
+        for _ in range(convNum - 1):
+            layers.append(nn.Conv2d(outChannels, outChannels, kernel_size=3, padding=1))
+            layers.append(nn.BatchNorm2d(outChannels))
+            layers.append(nn.ReLU())
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.inConv(x)
+        x = self.conv(x)
+        return x
 
 
 class ResidualBlock(nn.Module):
@@ -13,8 +37,13 @@ class ResidualBlock(nn.Module):
             nn.Conv2d(channels, channels, kernel_size=3, padding=1)
         )
 
+        self.eca = ECABlock(channels)
+
     def forward(self, x):
         residual = self.conv(x)
+
+        residual = self.eca(residual)
+
         return x + residual
 
 
@@ -145,6 +174,29 @@ class _DenseBlock(nn.Module):
         return torch.cat(features, 1)
 
 
+class _DenseBlock_eca(nn.Module):
+    def __init__(self, num_layers, num_input_features, bn_size, growth_rate, drop_rate, memory_efficient=False):
+        super(_DenseBlock_eca, self).__init__()
+        for i in range(num_layers):
+            layer = _DenseLayer(
+                num_input_features + i * growth_rate,
+                growth_rate=growth_rate,
+                bn_size=bn_size,
+                drop_rate=drop_rate,
+                memory_efficient=memory_efficient,
+            )
+            self.add_module('denselayer%d' % (i + 1), layer)
+
+    def forward(self, init_features):
+        features = [init_features]
+        for name, layer in self.named_children():
+            new_features = layer(*features)
+            features.append(new_features)
+            y = torch.cat(features, 1)
+
+        return ECABlock(y)
+
+
 class _Transition(nn.Sequential):
     def __init__(self, num_input_features, num_output_features):
         super(_Transition, self).__init__()
@@ -160,7 +212,7 @@ class DenseNet(nn.Module):
                  num_init_features=64, bn_size=4, drop_rate=0, num_classes=256, memory_efficient=False):
         super(DenseNet, self).__init__()
 
-        # 首层卷积层
+        # 首层卷积层     执行之后为 [16, 64, 64, 64]
         self.features = nn.Sequential(OrderedDict([
             ('conv0', nn.Conv2d(3, num_init_features, kernel_size=7, stride=2,
                                 padding=3, bias=False)),
@@ -192,16 +244,6 @@ class DenseNet(nn.Module):
         # Final batch norm
         self.features.add_module('norm5', nn.BatchNorm2d(num_features))
 
-        self.fc1 = nn.Linear(1024 * 16 * 16, 1024)
-        self.bn0 = nn.BatchNorm1d(1024)
-
-        # Linear layer
-        self.classifier1 = nn.Linear(1024, 512)
-        self.bn1 = nn.BatchNorm1d(512)
-
-        self.classifier2 = nn.Linear(512, num_classes)
-        self.bn2 = nn.BatchNorm1d(256)
-
         # Official init from torch repo.
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -215,18 +257,44 @@ class DenseNet(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
+        self.conv_256 = nn.Conv2d(num_features, 256, kernel_size=1, stride=1, padding=0)
+
+        self.eca = ECABlock(256)
+
+        self.up = UpsampleBlock(256, 256, kernel_size=4, stride=2, padding=1)
+
     def forward(self, x):
         features = self.features(x)
+        # print(features.shape)  # [16, 1024, 16, 16]
 
-        out = F.relu(features, inplace=True)
+        features = self.conv_256(features)
+        # print(features.shape)  # [16, 256, 16, 16]
 
-        out = out.view(-1, 1024 * 16 * 16)
+        out = self.eca(features)
 
-        out = F.relu(self.bn0(self.fc1(out)))
-        out = F.relu(self.bn1(self.classifier1(out)))
-        out = F.relu(self.bn2(self.classifier2(out)))
+        out = out * features
 
+        out = self.up(out)
+
+        # print(out.shape)        # [16, 256]
         return out
+
+
+class ECABlock(nn.Module):
+    def __init__(self, channels, gamma=2, b=1):
+        super(ECABlock, self).__init__()
+        kernel_size = int(abs((math.log(channels, 2) + b) / gamma))
+        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
+        # print(kernel_size)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=kernel_size, padding=(kernel_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        v = self.avg_pool(x)
+        v = self.conv(v.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        v = self.sigmoid(v)
+        return x * v
 
 
 class FusionNet(nn.Module):
@@ -265,27 +333,46 @@ class FusionNet(nn.Module):
     def forward(self, x):
         x_3 = torch.cat([x, x, x], dim=1)
         y1 = self.desnet(x_3)
+        # print(y1.shape)
 
         y2 = F.interpolate(x, size=(259, 259), mode='bilinear', align_corners=True)
-        d1 = self.down1(y2)
-        d2 = self.down2(d1)
-        d3 = self.down3(d2)
-        d4 = self.down4(d3)
+        d1 = self.down1(y2)  # [16, 64, 256, 256]
+        d2 = self.down2(d1)  # [16, 64, 128, 128]
+        d3 = self.down3(d2)  # [16, 128, 64, 64]
+        d4 = self.down4(d3)  # [16, 256, 32, 32]
 
-        y1 = y1.unsqueeze(2).unsqueeze(2).expand_as(d4)
-        d4 = self.skip4(y1, d4)
 
-        d5 = self.down5(d4)
-        d6 = self.down6(d5)
-        d7 = self.down7(d6)
-        d8 = self.down8(d7)
+        d4 = self.skip4(y1,d4)
+        # print(d4.shape)
+
+        d5 = self.down5(d4)  # [16, 512, 16, 16]
+        d6 = self.down6(d5)  # [16, 512, 8, 8]
+        d7 = self.down7(d6)  # [16, 512, 4, 4]
+        d8 = self.down8(d7)  # [16, 512, 2, 2]
+
         d8 = self.residual(d8)
+
         u1 = self.skip1(self.up1(d8), d7)
         u2 = self.skip2(self.up2(u1), d6)
         u3 = self.skip3(self.up3(u2), d5)
         u4 = self.skip4(self.up4(u3), d4)
         u5 = self.skip5(self.up5(u4), d3)
         u6 = self.skip6(self.up6(u5), d2)
-        u7 = self.skip7(self.up7(u6), d1)
+        u7 = self.skip7(self.up7(u6), d1)  # [16, 64, 256, 256]
 
         return u7
+
+
+if __name__ == '__main__':
+    x = torch.randn([16, 1, 256, 256])
+
+    y = torch.randn([16, 3, 256, 256])
+    #
+    # net = FusionNet()
+    #
+    # x = net(x)
+    # print(x.shape)
+
+    des = DenseNet()
+    y = des(y)
+    print(y.shape)

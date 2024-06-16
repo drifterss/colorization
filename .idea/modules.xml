@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/10_CNN_colorization.iml" filepath="$PROJECT_DIR$/.idea/10_CNN_colorization.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/03_color_voc.iml" filepath="$PROJECT_DIR$/.idea/03_color_voc.iml" />
     </modules>
   </component>
 </project>

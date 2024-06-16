@@ -1,6 +1,12 @@
+import os
+
 import torch
+
 from torch.utils import data
+
+# 创建 加载训练集，验证集
 from torchvision import transforms
+
 from Data.color_data import GrayscaleImageFolder
 
 
@@ -23,6 +29,6 @@ def create_test_loader(args):
 def create_valid_loader(args):
     valid_transforms = transforms.Compose([transforms.Resize((256, 256))])
     valid_imagefolder = GrayscaleImageFolder(args.valid_path, valid_transforms)
-    valid_loader = torch.utils.data.DataLoader(valid_imagefolder, batch_size=1, shuffle=False)
+    valid_loader = torch.utils.data.DataLoader(valid_imagefolder, batch_size=45, shuffle=False)
 
     return valid_imagefolder, valid_loader
